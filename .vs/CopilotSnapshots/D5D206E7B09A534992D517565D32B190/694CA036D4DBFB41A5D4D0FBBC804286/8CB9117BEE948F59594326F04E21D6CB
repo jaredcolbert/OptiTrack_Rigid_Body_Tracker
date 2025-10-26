@@ -1,0 +1,76 @@
+﻿import sys
+import time
+from NatNetClient import NatNetClient
+
+SERVER_IP = "192.168.86.39"
+TARGET_ID = 1
+UNIT_SCALE = 1000.0  # meters -> millimeters
+
+
+def on_rigid_body(rigid_body_id, position, rotation, *rest):
+    try:
+        if rigid_body_id != TARGET_ID:
+            return
+        # Optional tracking valid flag (bool/int) as first extra arg
+        if rest and isinstance(rest[0], (bool, int)) and not bool(rest[0]):
+            return
+
+        x, y, z = position
+        # rotation is expected (qw, qx, qy, qz)
+        qw, qx, qy, qz = rotation
+        # convert to mm
+        x *= UNIT_SCALE
+        y *= UNIT_SCALE
+        z *= UNIT_SCALE
+        print(f"RB {rigid_body_id}: x={x:.3f} mm, y={y:.3f} mm, z={z:.3f} mm, qw={qw:.6f}, qx={qx:.6f}, qy={qy:.6f}, qz={qz:.6f}")
+    except Exception:
+        pass
+
+
+def main():
+    client = NatNetClient()
+    client.set_use_multicast(False)
+    try:
+        client.set_print_level(0)
+    except Exception:
+        pass
+    client.set_server_address(SERVER_IP)
+    client.set_client_address(SERVER_IP)
+    client.rigid_body_listener = on_rigid_body
+    try:
+        client.new_frame_listener = lambda *_a, **_k: None
+        client.new_frame_with_data_listener = lambda *_a, **_k: None
+    except Exception:
+        pass
+
+    if not client.run('d'):
+        print("ERROR: Could not start streaming client.")
+        try:
+            sys.exit(1)
+        except SystemExit:
+            return
+
+    time.sleep(1)
+    if not client.connected():
+        print("ERROR: Could not connect properly. Check Motive streaming and IP settings.")
+        try:
+            sys.exit(2)
+        except SystemExit:
+            return
+
+    print(f"Connected to NatNet server at {SERVER_IP} (Unicast). Printing RB {TARGET_ID} pose in mm…")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            client.shutdown()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
+
