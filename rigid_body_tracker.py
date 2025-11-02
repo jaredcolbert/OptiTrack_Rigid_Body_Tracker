@@ -11,9 +11,11 @@ import time
 import threading
 import numpy as np
 import csv
+import socket
 from datetime import datetime
 from NatNetClient import NatNetClient
 from position_calculations import PositionCalculator
+from simple_realtime_viz import SimpleRealtimeViz
 
 # =============================================================================
 # CONFIGURATION - Modify these settings as needed
@@ -29,12 +31,15 @@ from position_calculations import PositionCalculator
 # =============================================================================
 
 # Network Configuration
-DEFAULT_SERVER_IP = "192.168.86.39"  # NatNet server IP address
-DEFAULT_LOCAL_IP = "192.168.86.39"   # Local client IP address
+DEFAULT_SERVER_IP = "192.168.86.48"  # NatNet server IP address
+DEFAULT_LOCAL_IP = None               # Local client IP address (None = auto-detect)
 
 # Connection Settings
 CONNECTION_TIMEOUT = 15.0             # Seconds without data before considering disconnected
 CONNECTION_CHECK_INTERVAL = 2.0       # Seconds between connection checks
+
+# UDP Server Settings
+DEFAULT_UDP_PORT = 8888               # Default UDP port for command interface
 
 # Rigid Body IDs
 DEFAULT_FEMUR_ID = 1                  # Femur tracker rigid body ID
@@ -56,6 +61,96 @@ class Colors:
     UNDERLINE = '\033[4m'
     END = '\033[0m'  # Reset to default
 
+def get_local_ip_address(server_ip=None):
+    """
+    Automatically detect the local IP address on the same network as the server.
+    Falls back to detecting any non-localhost IP address.
+    
+    Args:
+        server_ip: Optional server IP to match network segment
+        
+    Returns:
+        str: Local IP address, or "0.0.0.0" if auto-detection fails
+    """
+    try:
+        # Method 1: Connect to server to determine local interface
+        if server_ip:
+            try:
+                # Create a UDP socket (doesn't actually connect, just determines route)
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect((server_ip, 80))  # Port doesn't matter for UDP
+                    local_ip = s.getsockname()[0]
+                    if local_ip and local_ip != '127.0.0.1':
+                        return local_ip
+            except:
+                pass
+        
+        # Method 2: Get hostname and resolve to IP
+        hostname = socket.gethostname()
+        local_ip = socket.gethostbyname(hostname)
+        if local_ip and local_ip != '127.0.0.1':
+            return local_ip
+        
+        # Method 3: Enumerate network interfaces
+        import platform
+        if platform.system() == 'Windows':
+            # Windows: Get network adapter IPs
+            import subprocess
+            try:
+                result = subprocess.run(['ipconfig'], capture_output=True, text=True, timeout=2, encoding='utf-8', errors='ignore')
+                for line in result.stdout.split('\n'):
+                    line = line.strip()
+                    # Look for IPv4 Address entries
+                    if 'IPv4' in line and 'Address' in line:
+                        # Format: "IPv4 Address. . . . . . . . . . . : 192.168.1.100"
+                        parts = line.split(':')
+                        if len(parts) >= 2:
+                            ip = parts[-1].strip()
+                            if ip and ip != '127.0.0.1' and not ip.startswith('169.254'):
+                                # Check if it's on the same subnet as server (if server_ip provided)
+                                if server_ip:
+                                    # Simple subnet check: same first 3 octets
+                                    if ip.rsplit('.', 1)[0] == server_ip.rsplit('.', 1)[0]:
+                                        return ip
+                                else:
+                                    return ip
+                # If we didn't find one on the same subnet, return any valid IP
+                result = subprocess.run(['ipconfig'], capture_output=True, text=True, timeout=2, encoding='utf-8', errors='ignore')
+                for line in result.stdout.split('\n'):
+                    line = line.strip()
+                    if 'IPv4' in line and 'Address' in line:
+                        parts = line.split(':')
+                        if len(parts) >= 2:
+                            ip = parts[-1].strip()
+                            if ip and ip != '127.0.0.1' and not ip.startswith('169.254'):
+                                return ip
+            except Exception:
+                pass
+        else:
+            # Linux/Mac: Use netifaces if available, or socket
+            try:
+                try:
+                    import netifaces  # type: ignore
+                except ImportError:
+                    pass
+                else:
+                    for interface in netifaces.interfaces():
+                        addrs = netifaces.ifaddresses(interface)
+                        if socket.AF_INET in addrs:
+                            for addr_info in addrs[socket.AF_INET]:
+                                ip = addr_info.get('addr')
+                                if ip and ip != '127.0.0.1' and not ip.startswith('169.254'):
+                                    return ip
+            except:
+                pass
+        
+        # Fallback: Return "0.0.0.0" (will bind to all interfaces)
+        return "0.0.0.0"
+        
+    except Exception as e:
+        print(f"{Colors.YELLOW}Warning: Could not auto-detect local IP: {e}{Colors.END}")
+        return "0.0.0.0"
+
 class RigidBodyTracker:
     def __init__(self, femur_id=DEFAULT_FEMUR_ID, stylus_id=DEFAULT_STYLUS_ID, 
                  server_ip=DEFAULT_SERVER_IP, local_ip=DEFAULT_LOCAL_IP):
@@ -68,6 +163,9 @@ class RigidBodyTracker:
         # Initialize position calculator
         self.calculator = PositionCalculator()
         
+        # Initialize simple visualizer
+        self.visualizer = SimpleRealtimeViz()
+        
         # Current position data
         self.femur_position = None
         self.femur_rotation = None
@@ -77,6 +175,19 @@ class RigidBodyTracker:
         # Data reception flags
         self.femur_data_received = False
         self.stylus_data_received = False
+        
+        # Timestamps for tracking data freshness
+        self.last_femur_data_time = 0
+        self.last_stylus_data_time = 0
+        self.data_timeout = 0.2  # Consider data stale if not received within 0.2 seconds
+        
+        # Track previous position to detect if data is actually updating
+        self.previous_femur_position = None
+        self.last_femur_position_change_time = 0
+        
+        # Frame tracking
+        self.femur_in_current_frame = False
+        self.frame_count = 0
         
         # Data storage
         self.captured_points = []  # List to store captured data points
@@ -91,6 +202,11 @@ class RigidBodyTracker:
         # Control flags
         self.running = True
         self.keyboard_thread = None
+        self.udp_thread = None
+        
+        # UDP server settings
+        self.udp_port = DEFAULT_UDP_PORT
+        self.udp_socket = None
         
         # Connection status
         self.connected = False
@@ -109,11 +225,23 @@ class RigidBodyTracker:
             server_ip = self.server_ip
         if local_ip is None:
             local_ip = self.local_ip
-            
+        
+        # Auto-detect local IP if not specified
+        if not local_ip or local_ip == server_ip:
+            print(f"{Colors.CYAN}Auto-detecting local IP address...{Colors.END}")
+            detected_ip = get_local_ip_address(server_ip)
+            if detected_ip:
+                local_ip = detected_ip
+                print(f"{Colors.GREEN}Detected local IP: {local_ip}{Colors.END}")
+            else:
+                # Use "0.0.0.0" to bind to all interfaces
+                local_ip = "0.0.0.0"
+                print(f"{Colors.YELLOW}Could not auto-detect local IP. Binding to all interfaces (0.0.0.0).{Colors.END}")
+        
         # Set server IP address
         self.client.set_server_address(server_ip)
         
-        # Set local IP address
+        # Set local IP address (0.0.0.0 will bind to all interfaces)
         self.client.local_ip_address = local_ip
         
         # Disable multicast to use unicast
@@ -124,6 +252,12 @@ class RigidBodyTracker:
         
         # Set up rigid body listener
         self.client.rigid_body_listener = self.on_rigid_body_received
+        
+        # Set up frame listener to detect when rigid body stops appearing in frames
+        try:
+            self.client.new_frame_listener = self.on_new_frame_received
+        except:
+            pass  # Frame listener may not be available in all NatNet versions
         
         print("Rigid Body Tracker")
         print("=" * 40)
@@ -138,7 +272,8 @@ class RigidBodyTracker:
         print("  'e' - Export data points to file")
         print("  'r' - Capture reference positions for coordinate calculation")
         print("  'u' - Calculate updated stylus position based on tracker movement")
-        print("  'p' - Calculate mapped point position (L1-L10, M1-M10)")
+        print("  'p <point>' - Calculate mapped point position (e.g., 'p L1', 'p M5')")
+        print("  'v' - Show visualization (sphere + L-M planes)")
         print("  't' - Test connection to NatNet server")
         print("  'q' - Quit the program")
         print("  'h' - Show this help")
@@ -153,19 +288,91 @@ class RigidBodyTracker:
     def on_rigid_body_received(self, rigid_body_id, position, rotation):
         """Callback function called when rigid body data is received"""
         # Update last data received timestamp
-        self.last_data_received = time.time()
+        current_time = time.time()
+        self.last_data_received = current_time
         
         # Check if this is the femur tracker
         if rigid_body_id == self.femur_id:
-            self.femur_position = list(position)
+            # Mark that femur appeared in this frame
+            self.femur_in_current_frame = True
+            
+            new_position = list(position)
+            
+            # Check if position has actually changed (not stale data)
+            position_changed = False
+            if self.previous_femur_position is None:
+                position_changed = True
+            else:
+                # Check if position changed by more than 0.1mm (1e-4 meters)
+                position_diff = np.linalg.norm(np.array(new_position) - np.array(self.previous_femur_position))
+                if position_diff > 1e-4:
+                    position_changed = True
+                    self.last_femur_position_change_time = current_time
+            
+            self.femur_position = new_position
             self.femur_rotation = list(rotation)
             self.femur_data_received = True
+            self.last_femur_data_time = current_time
+            self.previous_femur_position = new_position.copy() if position_changed else self.previous_femur_position
+            
+            # No automatic updates for simple visualizer
             
         # Check if this is the stylus
         elif rigid_body_id == self.stylus_id:
             self.stylus_position = list(position)
             self.stylus_rotation = list(rotation)
             self.stylus_data_received = True
+            self.last_stylus_data_time = current_time
+    
+    def on_new_frame_received(self, data_dict):
+        """Callback when a new frame is received - reset frame flags"""
+        # Reset flag at start of frame - will be set to True if rigid body appears in this frame
+        # Note: There's a race condition here - frame callback might fire before rigid body callback
+        # So we use a more lenient check in is_femur_data_fresh()
+        self.femur_in_current_frame = False
+        self.frame_count += 1
+    
+    def is_femur_data_fresh(self):
+        """Check if femur data is recent (not stale) and actually being tracked"""
+        if not self.femur_data_received or self.femur_position is None:
+            return False
+        
+        current_time = time.time()
+        
+        # Check 1: Data must be received recently
+        if (current_time - self.last_femur_data_time) >= self.data_timeout:
+            return False
+        
+        # Check 2: Position must have changed recently (indicating active tracking)
+        # If we've never seen a position change, allow it (initial state)
+        # Note: Allow up to 2 seconds without position change, as tracker might be stationary
+        if self.last_femur_position_change_time > 0:
+            # If position hasn't changed in the last 2 seconds, consider it stale
+            # But still allow if data is being received (might be stationary)
+            if (current_time - self.last_femur_position_change_time) >= 2.0:
+                # Only fail if we also haven't received data recently
+                if (current_time - self.last_femur_data_time) >= 0.5:
+                    return False
+        
+        # Check 3: Validate position values aren't zeros or invalid
+        # If position is all zeros or very close to zero, likely invalid
+        pos_array = np.array(self.femur_position)
+        if np.allclose(pos_array, 0, atol=1e-6):
+            return False
+        
+        # Check 4: Must have appeared in recent frames (if frame listener is working)
+        # Only apply this check if frames are being processed
+        # If frame listener isn't working, frame_count stays at 0 and we skip this check
+        if self.frame_count > 10:
+            # If we've seen frames but femur hasn't appeared in current frame,
+            # check if data is still being received
+            if not self.femur_in_current_frame:
+                # Only fail if data hasn't been received in a while
+                # This handles timing issues where frame arrives before rigid body callback
+                if (current_time - self.last_femur_data_time) >= 0.3:
+                    return False
+        
+        return True
     
     def capture_positions(self):
         """Capture and print current positions of both rigid bodies"""
@@ -588,13 +795,11 @@ class RigidBodyTracker:
         """
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
-        # Check if we have current femur data
-        if not self.femur_data_received or self.femur_position is None:
-            print(f"\n=== ERROR [{timestamp}] ===")
-            print(f"Femur Tracker (ID {self.femur_id}): No current data available")
-            print("Cannot calculate mapped point without current tracker data.")
-            print("=" * 50)
-            return None
+        # Check if we have current femur data that is fresh (not stale)
+        if not self.is_femur_data_fresh():
+            error_msg = "the object is not visible to the camera"
+            print(error_msg)
+            return {'error': error_msg}
         
         # Load reference data from CSV
         try:
@@ -618,24 +823,27 @@ class RigidBodyTracker:
                         'stylus': stylus_pos
                     }
         except FileNotFoundError:
+            error_msg = f"CSV file not found: {csv_filename}"
             print(f"\n=== ERROR [{timestamp}] ===")
-            print(f"CSV file not found: {csv_filename}")
+            print(error_msg)
             print("=" * 50)
-            return None
+            return {'error': error_msg}
         except Exception as e:
+            error_msg = f"Error reading CSV file: {e}"
             print(f"\n=== ERROR [{timestamp}] ===")
-            print(f"Error reading CSV file: {e}")
+            print(error_msg)
             print("=" * 50)
-            return None
+            return {'error': error_msg}
         
         # Check if requested point exists
         if point_label not in points:
-            print(f"\n=== ERROR [{timestamp}] ===")
-            print(f"Point '{point_label}' not found in CSV file")
+            error_msg = f"Point '{point_label}' not found in CSV file"
             available_points = ', '.join(sorted(points.keys()))
-            print(f"Available points: {available_points}")
+            full_msg = f"{error_msg}. Available points: {available_points}"
+            print(f"\n=== ERROR [{timestamp}] ===")
+            print(full_msg)
             print("=" * 50)
-            return None
+            return {'error': full_msg}
         
         # Get reference data for the requested point
         ref_femur_pos_mm = points[point_label]['femur']
@@ -691,8 +899,27 @@ class RigidBodyTracker:
         # Bottom row [0, 0, 0, 1]
         transformation_matrix[3, 3] = 1.0
         
-        # Display results
-        print(f"\n=== CALCULATED POSITION FOR {point_label} [{timestamp}] ===")
+        # Output only the 4x4 matrix values separated by commas (row-major order)
+        matrix_values = []
+        for i in range(4):
+            for j in range(4):
+                matrix_values.append(str(transformation_matrix[i, j]))
+        result_string = ','.join(matrix_values)
+        print(result_string)
+        return {
+            'success': True,
+            'matrix': result_string,
+            'point_label': point_label,
+            'calculated_position_mm': calculated_position_mm,
+            'transformation_matrix': transformation_matrix.tolist(),
+            'current_femur_pos_mm': current_femur_pos_mm,
+            'reference_femur_pos_mm': ref_femur_pos_mm,
+            'reference_stylus_pos_mm': ref_stylus_pos_mm,
+            'reference_femur_rotation': femur_rotation
+        }
+        # Original verbose output removed - now only prints comma-separated matrix values
+        if False:  # This block never executes, keeping for reference
+            print(f"\n=== CALCULATED POSITION FOR {point_label} [{timestamp}] ===")
         print(f"Current Femur Position:")
         print(f"  X={current_femur_pos_mm[0]:.2f}mm, Y={current_femur_pos_mm[1]:.2f}mm, Z={current_femur_pos_mm[2]:.2f}mm")
         print(f"Calculated Position:")
@@ -723,7 +950,12 @@ class RigidBodyTracker:
         """Handle keyboard input in a separate thread"""
         while self.running:
             try:
-                key = input().strip().lower()
+                user_input = input().strip()
+                
+                # Split input into command and arguments
+                parts = user_input.split(maxsplit=1)
+                key = parts[0].lower()
+                args = parts[1].strip().upper() if len(parts) > 1 else None
                 
                 if key == 'c':
                     self.capture_positions()
@@ -740,13 +972,27 @@ class RigidBodyTracker:
                 elif key == 't':
                     self.test_connection()
                 elif key == 'p':
-                    # Calculate mapped point
-                    print("\nEnter point label to calculate (e.g., L1, M5):")
-                    point_label = input().strip().upper()
-                    self.calculate_mapped_point(point_label)
+                    # Calculate mapped point - support both 'p L1' and just 'p'
+                    if args:
+                        # Single line command: 'p L1'
+                        point_label = args
+                        self.calculate_mapped_point(point_label)
+                    else:
+                        # Fallback to interactive prompt
+                        print("\nEnter point label to calculate (e.g., L1, M5):")
+                        point_label = input().strip().upper()
+                        self.calculate_mapped_point(point_label)
+                elif key == 'v':
+                    # Show visualization
+                    if self.femur_data_received and self.femur_position is not None:
+                        print("Generating visualization...")
+                        self.visualizer.show_visualization(self.femur_position, self.femur_rotation)
+                    else:
+                        print("No tracker data available. Press 'c' to check data status.")
                 elif key == 'q':
                     print("Quitting...")
                     self.running = False
+                    # No cleanup needed for simple visualizer
                     break
                 elif key == 'h':
                     print("\nKeyboard Controls:")
@@ -756,17 +1002,142 @@ class RigidBodyTracker:
                     print("  'e' - Export data points to file")
                     print("  'r' - Capture reference positions for coordinate calculation")
                     print("  'u' - Calculate updated stylus position based on tracker movement")
-                    print("  'p' - Calculate mapped point position (L1-L10, M1-M10)")
+                    print("  'p <point>' - Calculate mapped point position (e.g., 'p L1', 'p M5')")
+                    print("  'v' - Show visualization (sphere + L-M planes)")
                     print("  't' - Test connection to NatNet server")
                     print("  'q' - Quit the program")
                     print("  'h' - Show this help")
                 else:
-                    print("Unknown command. Press 'h' for help.")
+                    print(f"Unknown command: '{user_input}'. Press 'h' for help.")
                     
             except EOFError:
                 break
             except Exception as e:
                 print(f"Keyboard input error: {e}")
+    
+    def process_command(self, user_input):
+        """
+        Process a command and return response as string.
+        Used by both keyboard and UDP interfaces.
+        
+        Args:
+            user_input: Command string (e.g., 'p L1', 'c', 'h')
+            
+        Returns:
+            str: Response string
+        """
+        try:
+            # Split input into command and arguments
+            parts = user_input.strip().split(maxsplit=1)
+            if not parts:
+                return "Empty command"
+            
+            key = parts[0].lower()
+            args = parts[1].strip().upper() if len(parts) > 1 else None
+            
+            if key == 'p':
+                # Calculate mapped point
+                if not args:
+                    return "Error: Point label required (e.g., 'p L1')"
+                
+                point_label = args
+                result = self.calculate_mapped_point(point_label)
+                
+                if result is None:
+                    return "Error: Failed to calculate point"
+                elif 'error' in result:
+                    return result['error']
+                elif 'matrix' in result:
+                    return result['matrix']
+                else:
+                    return "Error: Unexpected result format"
+            
+            elif key == 'c':
+                # Capture positions - return formatted string
+                if not self.is_femur_data_fresh():
+                    return "Error: Femur tracker not visible"
+                
+                femur_pos_mm = self.calculator.convert_to_millimeters(self.femur_position)
+                result = f"Femur (ID {self.femur_id}): X={femur_pos_mm[0]:.2f}mm, Y={femur_pos_mm[1]:.2f}mm, Z={femur_pos_mm[2]:.2f}mm"
+                
+                if self.stylus_data_received and self.stylus_position is not None:
+                    stylus_pos_mm = self.calculator.convert_to_millimeters(self.stylus_position)
+                    result += f"\nStylus (ID {self.stylus_id}): X={stylus_pos_mm[0]:.2f}mm, Y={stylus_pos_mm[1]:.2f}mm, Z={stylus_pos_mm[2]:.2f}mm"
+                else:
+                    result += "\nStylus: No data"
+                
+                return result
+            
+            elif key == 'h':
+                return ("Commands:\n"
+                       "  p <point> - Calculate point matrix (e.g., 'p L1')\n"
+                       "  c - Capture and return current positions\n"
+                       "  h - Show this help\n"
+                       "  t - Test connection")
+            
+            elif key == 't':
+                # Test connection
+                if self.connected and self.is_femur_data_fresh():
+                    return "Connection: OK, Tracking: Active"
+                elif self.connected:
+                    return "Connection: OK, Tracking: Inactive (object not visible)"
+                else:
+                    return "Connection: Failed"
+            
+            else:
+                return f"Unknown command: '{key}'. Use 'h' for help."
+                
+        except Exception as e:
+            return f"Error processing command: {e}"
+    
+    def udp_server_handler(self):
+        """Handle UDP commands in a separate thread"""
+        try:
+            self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.udp_socket.bind(('0.0.0.0', self.udp_port))
+            self.udp_socket.settimeout(1.0)  # Timeout to allow checking self.running
+            
+            print(f"{Colors.GREEN}UDP server listening on port {self.udp_port}{Colors.END}")
+            
+            while self.running:
+                try:
+                    # Receive command
+                    data, addr = self.udp_socket.recvfrom(1024)
+                    command = data.decode('utf-8').strip()
+                    
+                    # Strip quotes if present (common when sending from Python/scripts)
+                    if command.startswith('"') and command.endswith('"'):
+                        command = command[1:-1]
+                    elif command.startswith("'") and command.endswith("'"):
+                        command = command[1:-1]
+                    
+                    # Process command and get response
+                    response = self.process_command(command)
+                    
+                    # Send response back
+                    response_bytes = response.encode('utf-8')
+                    self.udp_socket.sendto(response_bytes, addr)
+                    
+                except socket.timeout:
+                    # Timeout is expected - check if we should continue running
+                    continue
+                except Exception as e:
+                    # Send error response if possible
+                    try:
+                        error_response = f"Error: {str(e)}".encode('utf-8')
+                        self.udp_socket.sendto(error_response, addr)
+                    except:
+                        pass  # If we can't send error, just continue
+                        
+        except Exception as e:
+            print(f"{Colors.RED}UDP server error: {e}{Colors.END}")
+        finally:
+            if self.udp_socket:
+                try:
+                    self.udp_socket.close()
+                except:
+                    pass
     
     def connect_and_run(self):
         """Connect to the server and start receiving data"""
@@ -786,6 +1157,10 @@ class RigidBodyTracker:
                 # Start keyboard input thread
                 self.keyboard_thread = threading.Thread(target=self.keyboard_input_handler, daemon=True)
                 self.keyboard_thread.start()
+                
+                # Start UDP server thread
+                self.udp_thread = threading.Thread(target=self.udp_server_handler, daemon=True)
+                self.udp_thread.start()
                 
                 # Keep the script running with connection monitoring
                 try:
